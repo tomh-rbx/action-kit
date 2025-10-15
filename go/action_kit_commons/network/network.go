@@ -89,6 +89,64 @@ func generateAndRunCommands(ctx context.Context, runner CommandRunner, opts Opts
 		logCurrentTcRules(ctx, runner, "before")
 	}
 
+<<<<<<< Updated upstream
+=======
+	// If opts provide nftables or iptables scripts, execute them first
+	if nft, ok := opts.(NftablesScriptProvider); ok {
+		script, scriptErr := nft.NftablesScript(mode)
+		if scriptErr != nil {
+			return scriptErr
+		}
+		if log.Debug().Enabled() && strings.TrimSpace(script) != "" {
+			log.Debug().Str("mode", string(mode)).Str("nft", script).Msg("prepared nftables script")
+		}
+		if len(strings.TrimSpace(script)) > 0 {
+			lines := strings.Split(strings.TrimRight(script, "\n"), "\n")
+			if _, restoreErr := runner.run(ctx, []string{"nft", "-f", "-"}, lines); restoreErr != nil {
+				err = errors.Join(err, restoreErr)
+			}
+		}
+	}
+
+	// Try eBPF first for DNS error injection (if supported)
+	if dnsOpts, ok := opts.(*DNSErrorInjectionOpts); ok && mode == ModeAdd {
+		if success, eBPFErr := dnsOpts.TryEBPF(); success {
+			log.Debug().Msg("using eBPF for DNS error injection")
+			// eBPF is handling the marking, so we skip iptables
+		} else if eBPFErr != nil {
+			log.Debug().Err(eBPFErr).Msg("eBPF not available, falling back to iptables")
+		}
+	}
+
+	// Fallback iptables provider (legacy)
+	if provider, ok := opts.(IptablesScriptProvider); ok {
+		v4, v6, scriptErr := provider.IptablesScripts(mode)
+		if scriptErr != nil {
+			return scriptErr
+		}
+		if log.Debug().Enabled() {
+			if strings.TrimSpace(v4) != "" {
+				log.Debug().Str("mode", string(mode)).Str("iptables_v4", v4).Msg("prepared iptables-restore script (IPv4)")
+			}
+			if strings.TrimSpace(v6) != "" {
+				log.Debug().Str("mode", string(mode)).Str("iptables_v6", v6).Msg("prepared ip6tables-restore script (IPv6)")
+			}
+		}
+		if len(strings.TrimSpace(v4)) > 0 {
+			lines := strings.Split(strings.TrimRight(v4, "\n"), "\n")
+			if _, restoreErr := runner.run(ctx, []string{"iptables-restore", "-w", "-n"}, lines); restoreErr != nil {
+				err = errors.Join(err, restoreErr)
+			}
+		}
+		if ipv6Supported() && len(strings.TrimSpace(v6)) > 0 {
+			lines := strings.Split(strings.TrimRight(v6, "\n"), "\n")
+			if _, restoreErr := runner.run(ctx, []string{"ip6tables-restore", "-w", "-n"}, lines); restoreErr != nil {
+				err = errors.Join(err, restoreErr)
+			}
+		}
+	}
+
+>>>>>>> Stashed changes
 	if len(ipCommandsV4) > 0 {
 		if _, ipErr := executeIpCommands(ctx, runner, ipCommandsV4, "-family", string(FamilyV4)); ipErr != nil {
 			err = errors.Join(err, FilterBatchErrors(ipErr, mode, ipCommandsV4))
