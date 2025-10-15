@@ -6,11 +6,12 @@ package network
 import (
 	"bytes"
 	"fmt"
-	"github.com/rs/zerolog/log"
 	"net"
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/rs/zerolog/log"
 )
 
 type Mode string
@@ -35,8 +36,6 @@ type Opts interface {
 	String() string
 }
 
-<<<<<<< Updated upstream
-=======
 // IptablesScriptProvider is an optional interface that Opts can implement
 // to provide iptables/ip6tables shell scripts which will be executed before
 // tc commands. This is useful for marking packets that tc should act upon.
@@ -56,7 +55,6 @@ type NftablesScriptProvider interface {
 	NftablesScript(mode Mode) (string, error)
 }
 
->>>>>>> Stashed changes
 type Filter struct {
 	Include []NetWithPortRange
 	Exclude []NetWithPortRange

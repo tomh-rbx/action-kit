@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/rs/zerolog/log"
@@ -89,8 +90,6 @@ func generateAndRunCommands(ctx context.Context, runner CommandRunner, opts Opts
 		logCurrentTcRules(ctx, runner, "before")
 	}
 
-<<<<<<< Updated upstream
-=======
 	// If opts provide nftables or iptables scripts, execute them first
 	if nft, ok := opts.(NftablesScriptProvider); ok {
 		script, scriptErr := nft.NftablesScript(mode)
@@ -146,7 +145,6 @@ func generateAndRunCommands(ctx context.Context, runner CommandRunner, opts Opts
 		}
 	}
 
->>>>>>> Stashed changes
 	if len(ipCommandsV4) > 0 {
 		if _, ipErr := executeIpCommands(ctx, runner, ipCommandsV4, "-family", string(FamilyV4)); ipErr != nil {
 			err = errors.Join(err, FilterBatchErrors(ipErr, mode, ipCommandsV4))
