@@ -34,6 +34,7 @@ type DNSErrorInjectionOpts struct {
 	Interfaces  []string
 	ErrorTypes  []string // NXDOMAIN, SERVFAIL, or BOTH
 	ExecutionID string   // Execution ID for tracking the loader in the registry
+	IsContainer bool     // true for container attacks (docker0), false for host attacks (eth0/eno1)
 }
 
 func (o *DNSErrorInjectionOpts) IpCommands(_ Family, _ Mode) ([]string, error) {
@@ -97,6 +98,14 @@ func (o *DNSErrorInjectionOpts) TryEBPF() (bool, error) {
 		return false, fmt.Errorf("DNS error injection requires specific target IPs for safety")
 	}
 
+	// Check for catch-all 0.0.0.0/0 or ::/0 which would affect all containers
+	for _, include := range o.Include {
+		ipStr := include.Net.String()
+		if ipStr == "0.0.0.0/0" || ipStr == "::/0" {
+			return false, fmt.Errorf("DNS error injection cannot use catch-all IP ranges (0.0.0.0/0 or ::/0) - specific IPs must be configured to prevent affecting all containers")
+		}
+	}
+
 	// Create eBPF loader
 	loader, err := ebpf.NewDNSErrorInjectionLoader()
 	if err != nil {
@@ -105,8 +114,9 @@ func (o *DNSErrorInjectionOpts) TryEBPF() (bool, error) {
 
 	// Convert our options to eBPF config
 	config := ebpf.DNSErrorInjectionConfig{
-		ErrorTypes: o.ErrorTypes,
-		Interfaces: o.Interfaces,
+		ErrorTypes:  o.ErrorTypes,
+		Interfaces:  o.Interfaces,
+		IsContainer: o.IsContainer,
 	}
 
 	// Add include CIDRs - these should be the specific container IPs
@@ -179,6 +189,11 @@ func (o *DNSErrorInjectionOpts) String() string {
 	sb.WriteString(strings.Join(o.ErrorTypes, ", "))
 	sb.WriteString(" (interfaces: ")
 	sb.WriteString(strings.Join(o.Interfaces, ", "))
+	if o.IsContainer {
+		sb.WriteString(", mode: container")
+	} else {
+		sb.WriteString(", mode: host")
+	}
 	sb.WriteString(")")
 	writeStringForFilters(&sb, optimizeFilter(o.Filter))
 	return sb.String()

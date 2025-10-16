@@ -25,6 +25,7 @@ const (
 	ConfigInjectNXDOMAIN  = 0x01
 	ConfigInjectSERVFAIL  = 0x02
 	ConfigRandomChoice    = 0x04
+	ConfigIsContainerMode = 0x08
 	SteadybitDNSErrorMark = 0x1
 	DnsPort               = 53
 )
@@ -36,6 +37,7 @@ type DNSErrorInjectionConfig struct {
 	IncludePorts []int
 	ExcludePorts []int
 	Interfaces   []string
+	IsContainer  bool // true for container attacks (docker0), false for host attacks (eth0/eno1)
 }
 
 type DNSErrorInjectionLoader struct {
@@ -117,6 +119,11 @@ func (l *DNSErrorInjectionLoader) configureMaps(config DNSErrorInjectionConfig) 
 		return fmt.Errorf("no valid DNS error types configured")
 	}
 
+	// Add container mode flag
+	if config.IsContainer {
+		configFlags |= ConfigIsContainerMode
+	}
+
 	// Set config flags
 	configMap := l.coll.Maps["config_map"]
 	if configMap != nil {
@@ -140,7 +147,9 @@ func (l *DNSErrorInjectionLoader) configureMaps(config DNSErrorInjectionConfig) 
 }
 
 func (l *DNSErrorInjectionLoader) configureCIDRMaps(config DNSErrorInjectionConfig) error {
-	// Configure IPv4 CIDR map
+	log.Info().Int("cidr_count", len(config.IncludeCIDRs)).Msg("configuring CIDR maps")
+
+	// Configure IPv4 CIDR map (now using hash map for exact matching)
 	ipv4Map := l.coll.Maps["ipv4_cidr_map"]
 	if ipv4Map != nil {
 		for _, cidr := range config.IncludeCIDRs {
@@ -154,18 +163,20 @@ func (l *DNSErrorInjectionLoader) configureCIDRMaps(config DNSErrorInjectionConf
 				continue // Skip IPv6 addresses
 			}
 
-			prefixLen, _ := ipNet.Mask.Size()
-			key := struct {
-				PrefixLen uint32
-				Addr      uint32
-			}{
-				PrefixLen: uint32(prefixLen),
-				Addr:      uint32(ipNet.IP.To4()[0])<<24 | uint32(ipNet.IP.To4()[1])<<16 | uint32(ipNet.IP.To4()[2])<<8 | uint32(ipNet.IP.To4()[3]),
-			}
+			// Store in the same byte order that bpf_ntohl will produce from network packets
+			// bpf_ntohl converts network byte order (big-endian) to host byte order (little-endian on x86)
+			// For IP 172.17.0.3 (0xAC110003 in network order), bpf_ntohl produces 0x031011AC
+			ipBytes := ipNet.IP.To4()
+			key := uint32(ipBytes[0])<<24 | uint32(ipBytes[1])<<16 | uint32(ipBytes[2])<<8 | uint32(ipBytes[3])
 
 			value := uint8(1)
 			if err := ipv4Map.Put(key, value); err != nil {
-				log.Warn().Str("cidr", cidr).Err(err).Msg("failed to add IPv4 CIDR to map")
+				log.Warn().Str("cidr", cidr).Err(err).Msg("failed to add IPv4 to map")
+			} else {
+				log.Info().
+					Str("cidr", cidr).
+					Uint32("addr_host_endian", key).
+					Msg("added IPv4 (host-endian) to eBPF hash map")
 			}
 		}
 	}
@@ -358,25 +369,38 @@ func (l *DNSErrorInjectionLoader) Close() error {
 }
 
 type metricsValue struct {
-	Seen             uint64
-	IPv4             uint64
-	IPv6             uint64
-	EgressQueries    uint64
-	IngressResponses uint64
-	DNSMatched       uint64
-	Injected         uint64
-	InjectedNXDOMAIN uint64
-	InjectedSERVFAIL uint64
+	Seen              uint64
+	IPv4              uint64
+	IPv6              uint64
+	EgressQueries     uint64
+	IngressResponses  uint64
+	DNSMatched        uint64
+	Injected          uint64
+	InjectedNXDOMAIN  uint64
+	InjectedSERVFAIL  uint64
+	IPv4AllowedCalled uint64
+	IPv4AllowedPassed uint64
+	LastSaddr         uint32 // diagnostic: last seen source IP (network byte order)
+	LastDaddr         uint32 // diagnostic: last seen dest IP (network byte order)
+	LastRejectedSaddr uint32 // diagnostic: last rejected source IP
+	LastRejectedDaddr uint32 // diagnostic: last rejected dest IP
+	LastLookupSrcNE   uint32 // diagnostic: last source IP we looked up (network-endian)
+	LastLookupSrcHE   uint32 // diagnostic: last source IP we looked up (host-endian)
+	LastLookupDstHE   uint32 // diagnostic: last dest IP we looked up (host-endian)
+	_                 uint32 // padding to align to 8 bytes (28 bytes of uint32 + 4 padding = 32 bytes)
 }
 
 func (l *DNSErrorInjectionLoader) startMetricsLogger(interval time.Duration) {
 	if l.coll == nil {
+		log.Warn().Msg("metrics logger: coll is nil, not starting")
 		return
 	}
 	metrics := l.coll.Maps["metrics_map"]
 	if metrics == nil {
+		log.Warn().Msg("metrics logger: metrics_map not found, not starting")
 		return
 	}
+	log.Info().Dur("interval", interval).Msg("starting DNS error injection metrics logger")
 	l.metricsStop = make(chan struct{})
 	l.metricsDone = make(chan struct{})
 	go func() {
@@ -388,23 +412,58 @@ func (l *DNSErrorInjectionLoader) startMetricsLogger(interval time.Duration) {
 		for {
 			select {
 			case <-l.metricsStop:
+				log.Info().Msg("metrics logger stopped")
 				return
 			case <-ticker.C:
 				// Reset local copy
 				mv = metricsValue{}
-				if err := metrics.Lookup(&key, &mv); err == nil {
-					log.Info().
-						Uint64("seen", mv.Seen).
-						Uint64("ipv4", mv.IPv4).
-						Uint64("ipv6", mv.IPv6).
-						Uint64("egress_queries", mv.EgressQueries).
-						Uint64("ingress_responses", mv.IngressResponses).
-						Uint64("dns_matched", mv.DNSMatched).
-						Uint64("injected", mv.Injected).
-						Uint64("injected_nxdomain", mv.InjectedNXDOMAIN).
-						Uint64("injected_servfail", mv.InjectedSERVFAIL).
-						Msg("dns-error-injection metrics")
+				if err := metrics.Lookup(&key, &mv); err != nil {
+					log.Debug().Err(err).Msg("metrics lookup failed - eBPF program may not be executing")
+					continue
 				}
+
+				// Convert IPs from network byte order to strings for logging
+				formatIP := func(ip uint32) string {
+					return fmt.Sprintf("%d.%d.%d.%d",
+						byte(ip&0xff),
+						byte((ip>>8)&0xff),
+						byte((ip>>16)&0xff),
+						byte((ip>>24)&0xff))
+				}
+
+				logEvent := log.Info().
+					Uint64("seen", mv.Seen).
+					Uint64("ipv4", mv.IPv4).
+					Uint64("ipv6", mv.IPv6).
+					Uint64("egress_queries", mv.EgressQueries).
+					Uint64("ingress_responses", mv.IngressResponses).
+					Uint64("dns_matched", mv.DNSMatched).
+					Uint64("injected", mv.Injected).
+					Uint64("injected_nxdomain", mv.InjectedNXDOMAIN).
+					Uint64("injected_servfail", mv.InjectedSERVFAIL).
+					Uint64("ipv4_allowed_called", mv.IPv4AllowedCalled).
+					Uint64("ipv4_allowed_passed", mv.IPv4AllowedPassed)
+
+				if mv.LastSaddr != 0 || mv.LastDaddr != 0 {
+					logEvent = logEvent.
+						Str("last_saddr", formatIP(mv.LastSaddr)).
+						Str("last_daddr", formatIP(mv.LastDaddr))
+				}
+
+				if mv.LastRejectedSaddr != 0 || mv.LastRejectedDaddr != 0 {
+					logEvent = logEvent.
+						Str("last_rejected_saddr", formatIP(mv.LastRejectedSaddr)).
+						Str("last_rejected_daddr", formatIP(mv.LastRejectedDaddr))
+				}
+
+				if mv.LastLookupSrcNE != 0 {
+					logEvent = logEvent.
+						Str("last_lookup_src_ne", formatIP(mv.LastLookupSrcNE)).
+						Str("last_lookup_src_he", formatIP(mv.LastLookupSrcHE)).
+						Str("last_lookup_dst_he", formatIP(mv.LastLookupDstHE))
+				}
+
+				logEvent.Msg("dns-error-injection metrics")
 			}
 		}
 	}()

@@ -20,6 +20,7 @@
 #define CONFIG_INJECT_NXDOMAIN 0x01
 #define CONFIG_INJECT_SERVFAIL 0x02
 #define CONFIG_RANDOM_CHOICE 0x04
+#define CONFIG_IS_CONTAINER_MODE 0x08
 
 // Header cursor structure for parsing (Megazord style)
 struct hdr_cursor {
@@ -46,7 +47,7 @@ struct dns_header {
 struct ipv4_lpm_key {
 	__u32 prefixlen;
 	__u32 addr;
-};
+} __attribute__((packed));
 
 // IPv6 LPM Trie key
 struct ipv6_lpm_key {
@@ -65,6 +66,15 @@ struct metrics_value {
 	__u64 injected;
 	__u64 injected_nxdomain;
 	__u64 injected_servfail;
+	__u64 ipv4_allowed_called;
+	__u64 ipv4_allowed_passed;
+	__u32 last_saddr; // diagnostic: last seen source IP (network byte order)
+	__u32 last_daddr; // diagnostic: last seen dest IP (network byte order)
+	__u32 last_rejected_saddr; // diagnostic: last rejected source IP
+	__u32 last_rejected_daddr; // diagnostic: last rejected dest IP
+	__u32 last_lookup_src_ne; // diagnostic: last source IP we looked up (network-endian)
+	__u32 last_lookup_src_he; // diagnostic: last source IP we looked up (host-endian)
+	__u32 last_lookup_dst_he; // diagnostic: last dest IP we looked up (host-endian)
 };
 
 // Maps
@@ -75,12 +85,12 @@ struct {
 	__type(value, __u8);
 } config_map SEC(".maps");
 
+// Use hash map for exact IP matching (more efficient than LPM trie for /32)
 struct {
-	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
-	__type(key, struct ipv4_lpm_key);
+	__type(key, __u32);
 	__type(value, __u8);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
 } ipv4_cidr_map SEC(".maps");
 
 struct {
@@ -196,17 +206,27 @@ static __always_inline int get_config_flags()
 	return v ? *v : 0;
 }
 
-static __always_inline int ipv4_allowed(__u32 saddr, __u32 daddr)
+static __always_inline int ipv4_allowed(__u32 saddr, __u32 daddr, struct metrics_value *mv)
 {
-	struct ipv4_lpm_key key;
-	key.prefixlen = 32;
-	key.addr = saddr;
-	if (bpf_map_lookup_elem(&ipv4_cidr_map, &key))
+	// Use hash map for exact IP matching (simpler and more efficient than LPM trie)
+    // Convert to host-endian to match how loader stores keys
+    __u32 src = bpf_ntohl(saddr);
+    __u32 dst = bpf_ntohl(daddr);
+	
+	// Store lookup values for diagnostics
+	if (mv) {
+		mv->last_lookup_src_ne = saddr;
+		mv->last_lookup_src_he = src;
+		mv->last_lookup_dst_he = dst;
+	}
+	
+	if (bpf_map_lookup_elem(&ipv4_cidr_map, &src))
 		return 1;
-	key.addr = daddr;
-	if (bpf_map_lookup_elem(&ipv4_cidr_map, &key))
+	if (bpf_map_lookup_elem(&ipv4_cidr_map, &dst))
 		return 1;
-	return 1; // Allow all by default if no rules configured
+	// If neither source nor destination IP matches the configured targets, block this traffic
+	// This ensures we only affect the specific container(s) configured in the attack
+	return 0;
 }
 
 static __always_inline int ipv6_allowed(__u8 *saddr, __u8 *daddr)
@@ -219,7 +239,9 @@ static __always_inline int ipv6_allowed(__u8 *saddr, __u8 *daddr)
 	__builtin_memcpy(key.addr, daddr, sizeof(key.addr));
 	if (bpf_map_lookup_elem(&ipv6_cidr_map, &key))
 		return 1;
-	return 1; // Allow all by default if no rules configured
+	// If neither source nor destination IP matches the configured targets, block this traffic
+	// This ensures we only affect the specific container(s) configured in the attack
+	return 0;
 }
 
 static __always_inline int port_allowed(__u16 port)
@@ -414,8 +436,22 @@ static __always_inline int process(struct __sk_buff *skb, int is_egress)
 		}
 
 		// Check if this traffic is allowed based on IP/port filters
-		if (!ipv4_allowed(iph->saddr, iph->daddr))
+		if (mv) {
+			mv->ipv4_allowed_called++;
+			// Capture the last seen IPs for diagnostics (in network byte order)
+			mv->last_saddr = iph->saddr;
+			mv->last_daddr = iph->daddr;
+		}
+		if (!ipv4_allowed(iph->saddr, iph->daddr, mv)) {
+			// Capture rejected IPs for diagnostics
+			if (mv) {
+				mv->last_rejected_saddr = iph->saddr;
+				mv->last_rejected_daddr = iph->daddr;
+			}
 			return TC_ACT_OK;
+		}
+		if (mv)
+			mv->ipv4_allowed_passed++;
 		if (!port_allowed(sport) && !port_allowed(dport))
 			return TC_ACT_OK;
 
@@ -555,17 +591,37 @@ static __always_inline int process(struct __sk_buff *skb, int is_egress)
 SEC("tc/ingress")
 int ingress_cls_func(struct __sk_buff *skb)
 {
-	// Ingress to docker0 = traffic FROM containers (queries going out)
-	// From the container's perspective, this is egress
-	return process(skb, 1);  // is_egress=1
+	// Directionality depends on mode:
+	// - Container mode (docker0): ingress = traffic FROM containers (queries)
+	// - Host mode (eth0/eno1): ingress = traffic TO host (responses)
+	int flags = get_config_flags();
+	int is_container_mode = (flags & CONFIG_IS_CONTAINER_MODE) != 0;
+	
+	if (is_container_mode) {
+		// Ingress to docker0 = traffic FROM containers (queries going out)
+		return process(skb, 1);  // is_egress=1 (container's perspective)
+	} else {
+		// Ingress to host interface = traffic TO host (responses coming in)
+		return process(skb, 0);  // is_egress=0 (host's perspective)
+	}
 }
 
 SEC("tc/egress")
 int egress_cls_func(struct __sk_buff *skb)
 {
-	// Egress from docker0 = traffic TO containers (responses coming in)
-	// From the container's perspective, this is ingress
-	return process(skb, 0);  // is_egress=0
+	// Directionality depends on mode:
+	// - Container mode (docker0): egress = traffic TO containers (responses)
+	// - Host mode (eth0/eno1): egress = traffic FROM host (queries)
+	int flags = get_config_flags();
+	int is_container_mode = (flags & CONFIG_IS_CONTAINER_MODE) != 0;
+	
+	if (is_container_mode) {
+		// Egress from docker0 = traffic TO containers (responses coming in)
+		return process(skb, 0);  // is_egress=0 (container's perspective)
+	} else {
+		// Egress from host interface = traffic FROM host (queries going out)
+		return process(skb, 1);  // is_egress=1 (host's perspective)
+	}
 }
 
 char _license[] SEC("license") = "GPL";
