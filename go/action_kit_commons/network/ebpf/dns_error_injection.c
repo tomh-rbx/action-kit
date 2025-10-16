@@ -220,6 +220,12 @@ static __always_inline int ipv4_allowed(__u32 saddr, __u32 daddr, struct metrics
 		mv->last_lookup_dst_he = dst;
 	}
 	
+	// Check for wildcard (0.0.0.0 stored as 0) which means allow all
+	__u32 wildcard = 0;
+	if (bpf_map_lookup_elem(&ipv4_cidr_map, &wildcard))
+		return 1;
+	
+	// Check for specific IP matches
 	if (bpf_map_lookup_elem(&ipv4_cidr_map, &src))
 		return 1;
 	if (bpf_map_lookup_elem(&ipv4_cidr_map, &dst))
@@ -483,21 +489,32 @@ static __always_inline int process(struct __sk_buff *skb, int is_egress)
 		// Inject error on egress (queries from container)
 		// We intercept the query and convert it to an error response immediately
 		if (is_egress) {
-			// Calculate DNS header offset (after UDP header)
-			__u32 dns_offset = udp_offset + sizeof(struct udphdr);
+		// Calculate DNS header offset (after UDP header)
+		__u32 dns_offset = udp_offset + sizeof(struct udphdr);
 
-			if (inject_dns_error(skb, eth_offset, ip_offset, udp_offset, dns_offset, error_type, 0)) {
-				if (mv) {
-					mv->injected++;
-					if (error_type == DNS_RCODE_NXDOMAIN)
-						mv->injected_nxdomain++;
-					else if (error_type == DNS_RCODE_SERVFAIL)
-						mv->injected_servfail++;
-				}
-				// Use bpf_redirect to send packet back to the same interface (ingress->egress)
-				// skb->ifindex is the current interface (docker0)
-				return bpf_redirect(skb->ifindex, 0);
+		if (inject_dns_error(skb, eth_offset, ip_offset, udp_offset, dns_offset, error_type, 0)) {
+			if (mv) {
+				mv->injected++;
+				if (error_type == DNS_RCODE_NXDOMAIN)
+					mv->injected_nxdomain++;
+				else if (error_type == DNS_RCODE_SERVFAIL)
+					mv->injected_servfail++;
 			}
+			
+			// Redirect strategy depends on mode:
+			// - Container mode (docker0): redirect to egress (packet loops back through bridge)
+			// - Host mode (eth0/eno1): redirect to ingress (packet goes back to host stack)
+			int flags = get_config_flags();
+			int is_container_mode = (flags & CONFIG_IS_CONTAINER_MODE) != 0;
+			
+			if (is_container_mode) {
+				// Container: redirect to egress (no BPF_F_INGRESS flag)
+				return bpf_redirect(skb->ifindex, 0);
+			} else {
+				// Host: redirect to ingress so host stack receives the error response
+				return bpf_redirect(skb->ifindex, BPF_F_INGRESS);
+			}
+		}
 		}
 
 	} else if (eth_proto == bpf_htons(ETH_P_IPV6)) {
@@ -566,23 +583,34 @@ static __always_inline int process(struct __sk_buff *skb, int is_egress)
 
 		// Inject error on egress (queries from container)
 		// We intercept the query and convert it to an error response immediately
-		if (is_egress) {
-			// Calculate DNS header offset (after UDP header)
-			__u32 dns_offset = udp_offset + sizeof(struct udphdr);
+	if (is_egress) {
+		// Calculate DNS header offset (after UDP header)
+		__u32 dns_offset = udp_offset + sizeof(struct udphdr);
 
-			if (inject_dns_error(skb, eth_offset, ip_offset, udp_offset, dns_offset, error_type, 1)) {
-				if (mv) {
-					mv->injected++;
-					if (error_type == DNS_RCODE_NXDOMAIN)
-						mv->injected_nxdomain++;
-					else if (error_type == DNS_RCODE_SERVFAIL)
-						mv->injected_servfail++;
-				}
-				// Use bpf_redirect to send packet back to the same interface (ingress->egress)
-				// skb->ifindex is the current interface (docker0)
+		if (inject_dns_error(skb, eth_offset, ip_offset, udp_offset, dns_offset, error_type, 1)) {
+			if (mv) {
+				mv->injected++;
+				if (error_type == DNS_RCODE_NXDOMAIN)
+					mv->injected_nxdomain++;
+				else if (error_type == DNS_RCODE_SERVFAIL)
+					mv->injected_servfail++;
+			}
+			
+			// Redirect strategy depends on mode:
+			// - Container mode (docker0): redirect to egress (packet loops back through bridge)
+			// - Host mode (eth0/eno1): redirect to ingress (packet goes back to host stack)
+			int flags = get_config_flags();
+			int is_container_mode = (flags & CONFIG_IS_CONTAINER_MODE) != 0;
+			
+			if (is_container_mode) {
+				// Container: redirect to egress (no BPF_F_INGRESS flag)
 				return bpf_redirect(skb->ifindex, 0);
+			} else {
+				// Host: redirect to ingress so host stack receives the error response
+				return bpf_redirect(skb->ifindex, BPF_F_INGRESS);
 			}
 		}
+	}
 	}
 
 	return TC_ACT_OK;

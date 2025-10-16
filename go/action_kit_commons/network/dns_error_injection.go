@@ -93,16 +93,19 @@ func (o *DNSErrorInjectionOpts) TryEBPF() (bool, error) {
 	}
 
 	// For DNS error injection, we need to be very specific about targeting
-	// Only use eBPF if we have specific container IPs to target
+	// For container attacks, only use eBPF if we have specific container IPs to target
 	if len(o.Include) == 0 {
 		return false, fmt.Errorf("DNS error injection requires specific target IPs for safety")
 	}
 
-	// Check for catch-all 0.0.0.0/0 or ::/0 which would affect all containers
-	for _, include := range o.Include {
-		ipStr := include.Net.String()
-		if ipStr == "0.0.0.0/0" || ipStr == "::/0" {
-			return false, fmt.Errorf("DNS error injection cannot use catch-all IP ranges (0.0.0.0/0 or ::/0) - specific IPs must be configured to prevent affecting all containers")
+	// For container attacks, check for catch-all 0.0.0.0/0 or ::/0 which would affect all containers
+	// For host attacks, catch-all ranges are allowed since they run in the host network namespace
+	if o.IsContainer {
+		for _, include := range o.Include {
+			ipStr := include.Net.String()
+			if ipStr == "0.0.0.0/0" || ipStr == "::/0" {
+				return false, fmt.Errorf("DNS error injection cannot use catch-all IP ranges (0.0.0.0/0 or ::/0) for container attacks - specific container IPs must be configured")
+			}
 		}
 	}
 
