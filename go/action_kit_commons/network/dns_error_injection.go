@@ -25,6 +25,7 @@ const (
 	DNSErrorTypeNXDOMAIN = "NXDOMAIN"
 	DNSErrorTypeSERVFAIL = "SERVFAIL"
 	DNSErrorTypeBoth     = "BOTH"
+	DNSErrorTypeTimeout  = "TIMEOUT"
 )
 
 // DNSErrorInjectionOpts injects DNS errors (NXDOMAIN/SERVFAIL) into DNS queries.
@@ -84,6 +85,7 @@ func (o *DNSErrorInjectionOpts) TryEBPF() (bool, error) {
 		DNSErrorTypeNXDOMAIN: true,
 		DNSErrorTypeSERVFAIL: true,
 		DNSErrorTypeBoth:     true,
+		DNSErrorTypeTimeout:  true,
 	}
 
 	for _, errorType := range o.ErrorTypes {

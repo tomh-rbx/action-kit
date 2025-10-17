@@ -1,5 +1,9 @@
 // +build ignore
 
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2025 Roblox Corporation
+// Author: Tom Handal <thandal@roblox.com>
+
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
@@ -11,27 +15,21 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+#include "packet_parse.h"
+#include "packet_parse.c"
+
 // DNS response codes
 #define DNS_RCODE_NOERROR 0
 #define DNS_RCODE_NXDOMAIN 3
 #define DNS_RCODE_SERVFAIL 2
+#define DNS_RCODE_TIMEOUT -1  // Special value to indicate drop
 
 // Config flags
 #define CONFIG_INJECT_NXDOMAIN 0x01
 #define CONFIG_INJECT_SERVFAIL 0x02
 #define CONFIG_RANDOM_CHOICE 0x04
 #define CONFIG_IS_CONTAINER_MODE 0x08
-
-// Header cursor structure for parsing (Megazord style)
-struct hdr_cursor {
-	void *pos;
-	void *data_end;
-};
-
-// Generic IP header for determining IP version
-struct geniphdr {
-	__u8 version;
-};
+#define CONFIG_INJECT_TIMEOUT 0x10
 
 // DNS header structure
 struct dns_header {
@@ -114,88 +112,6 @@ struct {
 	__type(key, __u32);
 	__type(value, struct metrics_value);
 } metrics_map SEC(".maps");
-
-// Megazord-style header parsers
-
-/**
- * parse_ethhdr parses Ethernet header and returns the next protocol
- **/
-static __always_inline int parse_ethhdr(struct hdr_cursor *hc, struct ethhdr **ethhdr)
-{
-	struct ethhdr *eth = hc->pos;
-
-	/* check packet bounds */
-	if (hc->pos + sizeof(struct ethhdr) > hc->data_end) {
-		return -1;
-	}
-
-	hc->pos += sizeof(*eth);
-	*ethhdr = eth;
-
-	return eth->h_proto;
-}
-
-/* parses IPv4 header and returns the next protocol */
-static __always_inline int parse_iphdr(struct hdr_cursor *hc, struct iphdr **iphdr)
-{
-	struct iphdr *ip = hc->pos;
-
-	if (hc->pos + sizeof(struct iphdr) > hc->data_end) {
-		return -1;
-	}
-
-	hc->pos += sizeof(*ip);
-	*iphdr = ip;
-
-	return ip->protocol;
-}
-
-/* parses IPv6 header and returns the next protocol */
-static __always_inline int parse_ipv6hdr(struct hdr_cursor *hc, struct ipv6hdr **ipv6hdr)
-{
-	struct ipv6hdr *ip6 = hc->pos;
-
-	if (hc->pos + sizeof(struct ipv6hdr) > hc->data_end) {
-		return -1;
-	}
-
-	hc->pos += sizeof(*ip6);
-	*ipv6hdr = ip6;
-
-	return ip6->nexthdr;
-}
-
-/* 
- * parses generic IP header and returns the version
- * this is useful in cases where packets don't have an Ethernet header
- */
-static __always_inline int parse_geniphdr(struct hdr_cursor *hc, struct geniphdr **geniphdr)
-{
-	struct geniphdr *ip = hc->pos;
-
-	if (hc->pos + sizeof(struct geniphdr) > hc->data_end) {
-		return -1;
-	}
-
-	*geniphdr = ip;
-
-	return ip->version >> 4; // IP version is in upper 4 bits
-}
-
-/* parses the UDP header and returns the data length */
-static __always_inline int parse_udphdr(struct hdr_cursor *hc, struct udphdr **udphdr)
-{
-	struct udphdr *udp = hc->pos;
-
-	if (hc->pos + sizeof(struct udphdr) > hc->data_end) {
-		return -1;
-	}
-
-	hc->pos += sizeof(*udp);
-	*udphdr = udp;
-
-	return sizeof(*udp);
-}
 
 // Helper functions
 
@@ -361,25 +277,242 @@ static __always_inline int inject_dns_error(struct __sk_buff *skb, __u32 eth_off
 	return 1;
 }
 
+// Determine which DNS error type to inject based on configuration flags
+static __always_inline int get_error_type(void)
+{
+	int flags = get_config_flags();
+	int error_type = DNS_RCODE_NXDOMAIN; // default
+
+	// Check for random choice first
+	if (flags & CONFIG_RANDOM_CHOICE) {
+		// Randomly choose between NXDOMAIN, SERVFAIL, and TIMEOUT
+		__u32 random = bpf_get_prandom_u32();
+		int choice = random % 3;
+		if (choice == 0) {
+			error_type = DNS_RCODE_NXDOMAIN;
+		} else if (choice == 1) {
+			error_type = DNS_RCODE_SERVFAIL;
+		} else {
+			error_type = DNS_RCODE_TIMEOUT;
+		}
+	} else if (flags & CONFIG_INJECT_TIMEOUT) {
+		error_type = DNS_RCODE_TIMEOUT;
+	} else if (flags & CONFIG_INJECT_SERVFAIL) {
+		error_type = DNS_RCODE_SERVFAIL;
+	} else if (flags & CONFIG_INJECT_NXDOMAIN) {
+		error_type = DNS_RCODE_NXDOMAIN;
+	}
+
+	return error_type;
+}
+
+// Inject DNS error or drop packet for timeout
+static __always_inline int inject_or_drop(struct __sk_buff *skb, __u32 eth_offset, __u32 ip_offset, 
+                                           __u32 udp_offset, int error_type, int is_ipv6, 
+                                           struct metrics_value *mv)
+{
+	__u32 dns_offset = udp_offset + sizeof(struct udphdr);
+
+	// For timeout, just drop the packet
+	if (error_type == DNS_RCODE_TIMEOUT) {
+		if (mv) {
+			mv->injected++;
+		}
+		return TC_ACT_SHOT; // Drop the packet
+	}
+
+	// Inject DNS error response
+	if (!inject_dns_error(skb, eth_offset, ip_offset, udp_offset, dns_offset, error_type, is_ipv6)) {
+		return TC_ACT_OK;
+	}
+
+	// Update metrics
+	if (mv) {
+		mv->injected++;
+		if (error_type == DNS_RCODE_NXDOMAIN)
+			mv->injected_nxdomain++;
+		else if (error_type == DNS_RCODE_SERVFAIL)
+			mv->injected_servfail++;
+	}
+
+	// Redirect strategy depends on mode:
+	// - Container mode (docker0): redirect to egress (packet loops back through bridge)
+	// - Host mode (eth0/eno1): redirect to ingress (packet goes back to host stack)
+	int flags = get_config_flags();
+	int is_container_mode = (flags & CONFIG_IS_CONTAINER_MODE) != 0;
+
+	if (is_container_mode) {
+		// Container: redirect to egress (no BPF_F_INGRESS flag)
+		return bpf_redirect(skb->ifindex, 0);
+	} else {
+		// Host: redirect to ingress so host stack receives the error response
+		return bpf_redirect(skb->ifindex, BPF_F_INGRESS);
+	}
+}
+
+// Process IPv4 DNS packets
+static __always_inline int process_ipv4(struct __sk_buff *skb, struct hdr_cursor *hc, 
+                                         __u32 eth_offset, __u32 ip_offset, int is_egress,
+                                         struct metrics_value *mv)
+{
+	struct iphdr *iph;
+	struct udphdr *udph;
+	int ip_proto;
+	__u32 udp_offset;
+
+	if (mv)
+		mv->ipv4++;
+
+	ip_proto = parse_iphdr(hc, &iph);
+	if (ip_proto < 0)
+		return TC_ACT_OK;
+
+	if (ip_proto != IPPROTO_UDP)
+		return TC_ACT_OK;
+
+	// Calculate UDP offset (after IP header)
+	udp_offset = ip_offset + ((__u32)iph->ihl * 4);
+
+	// Parse UDP header
+	if (parse_udphdr(hc, &udph) < 0)
+		return TC_ACT_OK;
+
+	// Check if this is DNS traffic (port 53)
+	__u16 sport = bpf_ntohs(udph->source);
+	__u16 dport = bpf_ntohs(udph->dest);
+
+	if (is_egress) {
+		if (dport != 53)
+			return TC_ACT_OK;
+		if (mv)
+			mv->egress_queries++;
+	} else {
+		if (sport != 53)
+			return TC_ACT_OK;
+		if (mv)
+			mv->ingress_responses++;
+	}
+
+	// Check if this traffic is allowed based on IP/port filters
+	if (mv) {
+		mv->ipv4_allowed_called++;
+		// Capture the last seen IPs for diagnostics (in network byte order)
+		mv->last_saddr = iph->saddr;
+		mv->last_daddr = iph->daddr;
+	}
+	if (!ipv4_allowed(iph->saddr, iph->daddr, mv)) {
+		// Capture rejected IPs for diagnostics
+		if (mv) {
+			mv->last_rejected_saddr = iph->saddr;
+			mv->last_rejected_daddr = iph->daddr;
+		}
+		return TC_ACT_OK;
+	}
+	if (mv)
+		mv->ipv4_allowed_passed++;
+	if (!port_allowed(sport) && !port_allowed(dport))
+		return TC_ACT_OK;
+
+	// For egress, check if this is a query
+	if (is_egress) {
+		if (!is_dns_query(hc))
+			return TC_ACT_OK;
+	}
+
+	if (mv)
+		mv->dns_matched++;
+
+	// Determine which error to inject
+	int error_type = get_error_type();
+	if (error_type == DNS_RCODE_NOERROR)
+		return TC_ACT_OK;
+
+	// Inject error on egress (queries from container/host)
+	if (is_egress) {
+		return inject_or_drop(skb, eth_offset, ip_offset, udp_offset, error_type, 0, mv);
+	}
+
+	return TC_ACT_OK;
+}
+
+// Process IPv6 DNS packets
+static __always_inline int process_ipv6(struct __sk_buff *skb, struct hdr_cursor *hc,
+                                         __u32 eth_offset, __u32 ip_offset, int is_egress,
+                                         struct metrics_value *mv)
+{
+	struct ipv6hdr *ip6h;
+	struct udphdr *udph;
+	int ip_proto;
+	__u32 udp_offset;
+
+	if (mv)
+		mv->ipv6++;
+
+	ip_proto = parse_ipv6hdr(hc, &ip6h);
+	if (ip_proto < 0)
+		return TC_ACT_OK;
+
+	if (ip_proto != IPPROTO_UDP)
+		return TC_ACT_OK;
+
+	// Calculate UDP offset (after IPv6 header - fixed 40 bytes)
+	udp_offset = ip_offset + sizeof(struct ipv6hdr);
+
+	// Parse UDP header
+	if (parse_udphdr(hc, &udph) < 0)
+		return TC_ACT_OK;
+
+	// Check if this is DNS traffic (port 53)
+	__u16 sport = bpf_ntohs(udph->source);
+	__u16 dport = bpf_ntohs(udph->dest);
+
+	if (is_egress) {
+		if (dport != 53)
+			return TC_ACT_OK;
+		if (mv)
+			mv->egress_queries++;
+	} else {
+		if (sport != 53)
+			return TC_ACT_OK;
+		if (mv)
+			mv->ingress_responses++;
+	}
+
+	// Check port filters
+	if (!port_allowed(sport) && !port_allowed(dport))
+		return TC_ACT_OK;
+
+	// For egress, check if this is a query
+	if (is_egress) {
+		if (!is_dns_query(hc))
+			return TC_ACT_OK;
+	}
+
+	if (mv)
+		mv->dns_matched++;
+
+	// Determine which error to inject
+	int error_type = get_error_type();
+	if (error_type == DNS_RCODE_NOERROR)
+		return TC_ACT_OK;
+
+	// Inject error on egress (queries from container/host)
+	if (is_egress) {
+		return inject_or_drop(skb, eth_offset, ip_offset, udp_offset, error_type, 1, mv);
+	}
+
+	return TC_ACT_OK;
+}
+
 // Main processing function
 static __always_inline int process(struct __sk_buff *skb, int is_egress)
 {
 	struct hdr_cursor hc;
 	struct ethhdr *eth;
-	struct iphdr *iph;
-	struct ipv6hdr *ip6h;
-	struct udphdr *udph;
 	struct geniphdr *geniph;
-	int eth_proto, ip_proto;
-
-	// Initialize header cursor
-	hc.pos = (void *)(long)skb->data;
-	hc.data_end = (void *)(long)skb->data_end;
-
-	// Track offsets for inject_dns_error
+	int eth_proto;
 	__u32 eth_offset = 0;
 	__u32 ip_offset = 0;
-	__u32 udp_offset = 0;
 
 	// Update metrics
 	__u32 mkey = 0;
@@ -387,6 +520,10 @@ static __always_inline int process(struct __sk_buff *skb, int is_egress)
 	if (mv) {
 		mv->seen++;
 	}
+
+	// Initialize header cursor
+	hc.pos = (void *)(long)skb->data;
+	hc.data_end = (void *)(long)skb->data_end;
 
 	// Try to parse Ethernet header first
 	eth_proto = parse_ethhdr(&hc, &eth);
@@ -406,211 +543,11 @@ static __always_inline int process(struct __sk_buff *skb, int is_egress)
 		}
 	}
 
-	// Parse IP header
+	// Dispatch to IPv4 or IPv6 processing
 	if (eth_proto == bpf_htons(ETH_P_IP)) {
-		if (mv)
-			mv->ipv4++;
-
-		ip_proto = parse_iphdr(&hc, &iph);
-		if (ip_proto < 0)
-			return TC_ACT_OK;
-
-		if (ip_proto != IPPROTO_UDP)
-			return TC_ACT_OK;
-
-		// Calculate UDP offset (after IP header)
-		udp_offset = ip_offset + ((__u32)iph->ihl * 4);
-
-		// Parse UDP header
-		if (parse_udphdr(&hc, &udph) < 0)
-			return TC_ACT_OK;
-
-		// Check if this is DNS traffic (port 53)
-		__u16 sport = bpf_ntohs(udph->source);
-		__u16 dport = bpf_ntohs(udph->dest);
-
-		if (is_egress) {
-			if (dport != 53)
-				return TC_ACT_OK;
-			if (mv)
-				mv->egress_queries++;
-		} else {
-			if (sport != 53)
-				return TC_ACT_OK;
-			if (mv)
-				mv->ingress_responses++;
-		}
-
-		// Check if this traffic is allowed based on IP/port filters
-		if (mv) {
-			mv->ipv4_allowed_called++;
-			// Capture the last seen IPs for diagnostics (in network byte order)
-			mv->last_saddr = iph->saddr;
-			mv->last_daddr = iph->daddr;
-		}
-		if (!ipv4_allowed(iph->saddr, iph->daddr, mv)) {
-			// Capture rejected IPs for diagnostics
-			if (mv) {
-				mv->last_rejected_saddr = iph->saddr;
-				mv->last_rejected_daddr = iph->daddr;
-			}
-			return TC_ACT_OK;
-		}
-		if (mv)
-			mv->ipv4_allowed_passed++;
-		if (!port_allowed(sport) && !port_allowed(dport))
-			return TC_ACT_OK;
-
-		// For egress, check if this is a query
-		if (is_egress) {
-			if (!is_dns_query(&hc))
-				return TC_ACT_OK;
-		}
-
-		if (mv)
-			mv->dns_matched++;
-
-		// Determine which error to inject
-		int flags = get_config_flags();
-		int error_type = DNS_RCODE_NXDOMAIN; // default
-
-		if ((flags & CONFIG_RANDOM_CHOICE) && (flags & CONFIG_INJECT_NXDOMAIN) && (flags & CONFIG_INJECT_SERVFAIL)) {
-			// Randomly choose between NXDOMAIN and SERVFAIL
-			__u32 random = bpf_get_prandom_u32();
-			error_type = (random % 2 == 0) ? DNS_RCODE_NXDOMAIN : DNS_RCODE_SERVFAIL;
-		} else if (flags & CONFIG_INJECT_SERVFAIL) {
-			error_type = DNS_RCODE_SERVFAIL;
-		} else if (flags & CONFIG_INJECT_NXDOMAIN) {
-			error_type = DNS_RCODE_NXDOMAIN;
-		} else {
-			return TC_ACT_OK; // No error injection configured
-		}
-
-		// Inject error on egress (queries from container)
-		// We intercept the query and convert it to an error response immediately
-		if (is_egress) {
-		// Calculate DNS header offset (after UDP header)
-		__u32 dns_offset = udp_offset + sizeof(struct udphdr);
-
-		if (inject_dns_error(skb, eth_offset, ip_offset, udp_offset, dns_offset, error_type, 0)) {
-			if (mv) {
-				mv->injected++;
-				if (error_type == DNS_RCODE_NXDOMAIN)
-					mv->injected_nxdomain++;
-				else if (error_type == DNS_RCODE_SERVFAIL)
-					mv->injected_servfail++;
-			}
-			
-			// Redirect strategy depends on mode:
-			// - Container mode (docker0): redirect to egress (packet loops back through bridge)
-			// - Host mode (eth0/eno1): redirect to ingress (packet goes back to host stack)
-			int flags = get_config_flags();
-			int is_container_mode = (flags & CONFIG_IS_CONTAINER_MODE) != 0;
-			
-			if (is_container_mode) {
-				// Container: redirect to egress (no BPF_F_INGRESS flag)
-				return bpf_redirect(skb->ifindex, 0);
-			} else {
-				// Host: redirect to ingress so host stack receives the error response
-				return bpf_redirect(skb->ifindex, BPF_F_INGRESS);
-			}
-		}
-		}
-
+		return process_ipv4(skb, &hc, eth_offset, ip_offset, is_egress, mv);
 	} else if (eth_proto == bpf_htons(ETH_P_IPV6)) {
-		if (mv)
-			mv->ipv6++;
-
-		ip_proto = parse_ipv6hdr(&hc, &ip6h);
-		if (ip_proto < 0)
-			return TC_ACT_OK;
-
-		if (ip_proto != IPPROTO_UDP)
-			return TC_ACT_OK;
-
-		// Calculate UDP offset (after IPv6 header)
-		udp_offset = ip_offset + sizeof(struct ipv6hdr);
-
-		// Parse UDP header
-		if (parse_udphdr(&hc, &udph) < 0)
-			return TC_ACT_OK;
-
-		// Check if this is DNS traffic (port 53)
-		__u16 sport = bpf_ntohs(udph->source);
-		__u16 dport = bpf_ntohs(udph->dest);
-
-		if (is_egress) {
-			if (dport != 53)
-				return TC_ACT_OK;
-			if (mv)
-				mv->egress_queries++;
-		} else {
-			if (sport != 53)
-				return TC_ACT_OK;
-			if (mv)
-				mv->ingress_responses++;
-		}
-
-		// Check if this traffic is allowed based on IP/port filters
-		if (!ipv6_allowed(ip6h->saddr.in6_u.u6_addr8, ip6h->daddr.in6_u.u6_addr8))
-			return TC_ACT_OK;
-		if (!port_allowed(sport) && !port_allowed(dport))
-			return TC_ACT_OK;
-
-		// For egress, check if this is a query
-		if (is_egress) {
-			if (!is_dns_query(&hc))
-				return TC_ACT_OK;
-		}
-
-		if (mv)
-			mv->dns_matched++;
-
-		// Determine which error to inject
-		int flags = get_config_flags();
-		int error_type = DNS_RCODE_NXDOMAIN; // default
-
-		if ((flags & CONFIG_RANDOM_CHOICE) && (flags & CONFIG_INJECT_NXDOMAIN) && (flags & CONFIG_INJECT_SERVFAIL)) {
-			__u32 random = bpf_get_prandom_u32();
-			error_type = (random % 2 == 0) ? DNS_RCODE_NXDOMAIN : DNS_RCODE_SERVFAIL;
-		} else if (flags & CONFIG_INJECT_SERVFAIL) {
-			error_type = DNS_RCODE_SERVFAIL;
-		} else if (flags & CONFIG_INJECT_NXDOMAIN) {
-			error_type = DNS_RCODE_NXDOMAIN;
-		} else {
-			return TC_ACT_OK;
-		}
-
-		// Inject error on egress (queries from container)
-		// We intercept the query and convert it to an error response immediately
-	if (is_egress) {
-		// Calculate DNS header offset (after UDP header)
-		__u32 dns_offset = udp_offset + sizeof(struct udphdr);
-
-		if (inject_dns_error(skb, eth_offset, ip_offset, udp_offset, dns_offset, error_type, 1)) {
-			if (mv) {
-				mv->injected++;
-				if (error_type == DNS_RCODE_NXDOMAIN)
-					mv->injected_nxdomain++;
-				else if (error_type == DNS_RCODE_SERVFAIL)
-					mv->injected_servfail++;
-			}
-			
-			// Redirect strategy depends on mode:
-			// - Container mode (docker0): redirect to egress (packet loops back through bridge)
-			// - Host mode (eth0/eno1): redirect to ingress (packet goes back to host stack)
-			int flags = get_config_flags();
-			int is_container_mode = (flags & CONFIG_IS_CONTAINER_MODE) != 0;
-			
-			if (is_container_mode) {
-				// Container: redirect to egress (no BPF_F_INGRESS flag)
-				return bpf_redirect(skb->ifindex, 0);
-			} else {
-				// Host: redirect to ingress so host stack receives the error response
-				return bpf_redirect(skb->ifindex, BPF_F_INGRESS);
-			}
-		}
-	}
+		return process_ipv6(skb, &hc, eth_offset, ip_offset, is_egress, mv);
 	}
 
 	return TC_ACT_OK;

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2025 Roblox Corporation
+// Author: Tom Handal <thandal@roblox.com>
+
 package ebpf
 
 import (
@@ -26,6 +30,7 @@ const (
 	ConfigInjectSERVFAIL  = 0x02
 	ConfigRandomChoice    = 0x04
 	ConfigIsContainerMode = 0x08
+	ConfigInjectTimeout   = 0x10
 	SteadybitDNSErrorMark = 0x1
 	DnsPort               = 53
 )
@@ -112,6 +117,10 @@ func (l *DNSErrorInjectionLoader) configureMaps(config DNSErrorInjectionConfig) 
 			configFlags |= ConfigInjectNXDOMAIN | ConfigInjectSERVFAIL | ConfigRandomChoice
 			hasNXDOMAIN = true
 			hasSERVFAIL = true
+		case "TIMEOUT":
+			configFlags |= ConfigInjectTimeout
+			// For timeout, we don't need NXDOMAIN or SERVFAIL, so we set a flag to skip the validation
+			hasNXDOMAIN = true // Just to pass validation - timeout is a valid standalone option
 		}
 	}
 

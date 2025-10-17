@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2025 Roblox Corporation
+// Author: Tom Handal <thandal@roblox.com>
+
 package ebpf
 
 import (
