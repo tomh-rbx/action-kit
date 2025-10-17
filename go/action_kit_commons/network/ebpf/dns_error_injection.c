@@ -41,38 +41,24 @@ struct dns_header {
 	__u16 arcount;
 };
 
-// IPv4 LPM Trie key
+// IPv4 LPM Trie key (not currently used, but kept for reference)
 struct ipv4_lpm_key {
 	__u32 prefixlen;
 	__u32 addr;
 } __attribute__((packed));
 
-// IPv6 LPM Trie key
-struct ipv6_lpm_key {
-	__u32 prefixlen;
-	__u8 addr[16];
-};
-
-// Metrics structure
+// Metrics structure - for displaying attack stats in UI
 struct metrics_value {
-	__u64 seen;
-	__u64 ipv4;
-	__u64 ipv6;
-	__u64 egress_queries;
-	__u64 ingress_responses;
-	__u64 dns_matched;
-	__u64 injected;
-	__u64 injected_nxdomain;
-	__u64 injected_servfail;
-	__u64 ipv4_allowed_called;
-	__u64 ipv4_allowed_passed;
-	__u32 last_saddr; // diagnostic: last seen source IP (network byte order)
-	__u32 last_daddr; // diagnostic: last seen dest IP (network byte order)
-	__u32 last_rejected_saddr; // diagnostic: last rejected source IP
-	__u32 last_rejected_daddr; // diagnostic: last rejected dest IP
-	__u32 last_lookup_src_ne; // diagnostic: last source IP we looked up (network-endian)
-	__u32 last_lookup_src_he; // diagnostic: last source IP we looked up (host-endian)
-	__u32 last_lookup_dst_he; // diagnostic: last dest IP we looked up (host-endian)
+	__u64 seen;                  // Total packets seen
+	__u64 ipv4;                  // IPv4 packets
+	__u64 ipv6;                  // IPv6 packets (future use)
+	__u64 dns_matched;           // DNS packets matching our filters
+	__u64 injected;              // Total DNS errors injected
+	__u64 injected_nxdomain;     // NXDOMAIN errors injected
+	__u64 injected_servfail;     // SERVFAIL errors injected
+	__u64 injected_timeout;      // TIMEOUT (dropped packets)
+	__u32 last_saddr;            // Last seen source IP (for debugging)
+	__u32 last_daddr;            // Last seen dest IP (for debugging)
 };
 
 // Maps
@@ -90,14 +76,6 @@ struct {
 	__type(key, __u32);
 	__type(value, __u8);
 } ipv4_cidr_map SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
-	__uint(max_entries, 1024);
-	__type(key, struct ipv6_lpm_key);
-	__type(value, __u8);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
-} ipv6_cidr_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -129,12 +107,6 @@ static __always_inline int ipv4_allowed(__u32 saddr, __u32 daddr, struct metrics
     __u32 src = bpf_ntohl(saddr);
     __u32 dst = bpf_ntohl(daddr);
 	
-	// Store lookup values for diagnostics
-	if (mv) {
-		mv->last_lookup_src_ne = saddr;
-		mv->last_lookup_src_he = src;
-		mv->last_lookup_dst_he = dst;
-	}
 	
 	// Check for wildcard (0.0.0.0 stored as 0) which means allow all
 	__u32 wildcard = 0;
@@ -145,21 +117,6 @@ static __always_inline int ipv4_allowed(__u32 saddr, __u32 daddr, struct metrics
 	if (bpf_map_lookup_elem(&ipv4_cidr_map, &src))
 		return 1;
 	if (bpf_map_lookup_elem(&ipv4_cidr_map, &dst))
-		return 1;
-	// If neither source nor destination IP matches the configured targets, block this traffic
-	// This ensures we only affect the specific container(s) configured in the attack
-	return 0;
-}
-
-static __always_inline int ipv6_allowed(__u8 *saddr, __u8 *daddr)
-{
-	struct ipv6_lpm_key key;
-	key.prefixlen = 128;
-	__builtin_memcpy(key.addr, saddr, sizeof(key.addr));
-	if (bpf_map_lookup_elem(&ipv6_cidr_map, &key))
-		return 1;
-	__builtin_memcpy(key.addr, daddr, sizeof(key.addr));
-	if (bpf_map_lookup_elem(&ipv6_cidr_map, &key))
 		return 1;
 	// If neither source nor destination IP matches the configured targets, block this traffic
 	// This ensures we only affect the specific container(s) configured in the attack
@@ -317,6 +274,7 @@ static __always_inline int inject_or_drop(struct __sk_buff *skb, __u32 eth_offse
 	if (error_type == DNS_RCODE_TIMEOUT) {
 		if (mv) {
 			mv->injected++;
+			mv->injected_timeout++;
 		}
 		return TC_ACT_SHOT; // Drop the packet
 	}
@@ -384,32 +342,20 @@ static __always_inline int process_ipv4(struct __sk_buff *skb, struct hdr_cursor
 	if (is_egress) {
 		if (dport != 53)
 			return TC_ACT_OK;
-		if (mv)
-			mv->egress_queries++;
 	} else {
 		if (sport != 53)
 			return TC_ACT_OK;
-		if (mv)
-			mv->ingress_responses++;
 	}
 
 	// Check if this traffic is allowed based on IP/port filters
 	if (mv) {
-		mv->ipv4_allowed_called++;
-		// Capture the last seen IPs for diagnostics (in network byte order)
+		// Capture the last seen IPs for debugging (in network byte order)
 		mv->last_saddr = iph->saddr;
 		mv->last_daddr = iph->daddr;
 	}
 	if (!ipv4_allowed(iph->saddr, iph->daddr, mv)) {
-		// Capture rejected IPs for diagnostics
-		if (mv) {
-			mv->last_rejected_saddr = iph->saddr;
-			mv->last_rejected_daddr = iph->daddr;
-		}
 		return TC_ACT_OK;
 	}
-	if (mv)
-		mv->ipv4_allowed_passed++;
 	if (!port_allowed(sport) && !port_allowed(dport))
 		return TC_ACT_OK;
 
@@ -469,13 +415,9 @@ static __always_inline int process_ipv6(struct __sk_buff *skb, struct hdr_cursor
 	if (is_egress) {
 		if (dport != 53)
 			return TC_ACT_OK;
-		if (mv)
-			mv->egress_queries++;
 	} else {
 		if (sport != 53)
 			return TC_ACT_OK;
-		if (mv)
-			mv->ingress_responses++;
 	}
 
 	// Check port filters

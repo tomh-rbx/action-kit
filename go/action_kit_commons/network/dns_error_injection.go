@@ -10,7 +10,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog/log"
+	"github.com/steadybit/action-kit/go/action_kit_api/v2"
 	"github.com/steadybit/action-kit/go/action_kit_commons/network/ebpf"
+	"github.com/steadybit/extension-kit/extutil"
 )
 
 // Global registry to track eBPF loaders by execution ID
@@ -58,6 +61,7 @@ func (o *DNSErrorInjectionOpts) TcCommands(mode Mode) ([]string, error) {
 		}
 		dnsLoaderRegistryLock.Unlock()
 
+		// Close the loader
 		if loader != nil {
 			if err := loader.Close(); err != nil {
 				return []string{}, fmt.Errorf("failed to cleanup eBPF loader: %w", err)
@@ -111,12 +115,6 @@ func (o *DNSErrorInjectionOpts) TryEBPF() (bool, error) {
 		}
 	}
 
-	// Create eBPF loader
-	loader, err := ebpf.NewDNSErrorInjectionLoader()
-	if err != nil {
-		return false, fmt.Errorf("create eBPF loader: %w", err)
-	}
-
 	// Convert our options to eBPF config
 	config := ebpf.DNSErrorInjectionConfig{
 		ErrorTypes:  o.ErrorTypes,
@@ -124,25 +122,35 @@ func (o *DNSErrorInjectionOpts) TryEBPF() (bool, error) {
 		IsContainer: o.IsContainer,
 	}
 
-	// Add include CIDRs - these should be the specific container IPs
+	// Extract container IP from includes - we'll add this to the shared loader
+	var containerIP string
 	for _, include := range o.Include {
 		if include.Net.IP != nil {
+			// Store the first IP as the container IP for this execution
+			if containerIP == "" {
+				containerIP = include.Net.IP.String()
+			}
 			config.IncludeCIDRs = append(config.IncludeCIDRs, include.Net.String())
 		}
 	}
 
-	// Add include ports - only DNS port
-	for _, include := range o.Include {
-		if include.PortRange.From != 0 {
-			config.IncludePorts = append(config.IncludePorts, int(include.PortRange.From))
-		}
+	if containerIP == "" {
+		return false, fmt.Errorf("no container IP found in includes")
 	}
+
+	// Port is always DNS port 53 (hardcoded in eBPF)
 
 	// Ensure the embedded object is present on the host filesystem
 	// We run eBPF on the host and target the container's network interface
 	const ebpfObjectPath = "/etc/steadybit/dns_error_injection.o"
 	if err := ebpf.WriteEmbeddedDNSErrorObject(ebpfObjectPath); err != nil {
 		return false, fmt.Errorf("write eBPF object: %w", err)
+	}
+
+	// Create a dedicated loader for this execution
+	loader, err := ebpf.NewDNSErrorInjectionLoader()
+	if err != nil {
+		return false, fmt.Errorf("create eBPF loader: %w", err)
 	}
 
 	// Try to load and attach eBPF program
@@ -155,8 +163,6 @@ func (o *DNSErrorInjectionOpts) TryEBPF() (bool, error) {
 	}
 
 	// Store the loader in the global registry for cleanup when the experiment stops
-	// The ExecutionID is used as the key to retrieve the loader during cleanup
-	// TcCommands(ModeDelete) will look up the loader by ExecutionID and call Close()
 	if o.ExecutionID != "" {
 		dnsLoaderRegistryLock.Lock()
 		dnsLoaderRegistry[o.ExecutionID] = loader
@@ -202,4 +208,58 @@ func (o *DNSErrorInjectionOpts) String() string {
 	sb.WriteString(")")
 	writeStringForFilters(&sb, optimizeFilter(o.Filter))
 	return sb.String()
+}
+
+// GetDNSErrorInjectionMessages retrieves metrics from the eBPF loader and formats them as markdown messages
+func GetDNSErrorInjectionMessages(executionID string) (*[]action_kit_api.Message, error) {
+	dnsLoaderRegistryLock.Lock()
+	loader, exists := dnsLoaderRegistry[executionID]
+	dnsLoaderRegistryLock.Unlock()
+
+	if !exists {
+		return nil, fmt.Errorf("no loader found for execution ID: %s", executionID)
+	}
+
+	// Get raw metrics from eBPF
+	mv, err := loader.GetRawMetrics()
+	if err != nil {
+		return nil, err
+	}
+
+	log.Debug().
+		Str("execution_id", executionID).
+		Uint64("seen", mv.Seen).
+		Uint64("dns_matched", mv.DNSMatched).
+		Uint64("injected", mv.Injected).
+		Msg("retrieved raw metrics from eBPF")
+
+	// Format markdown content
+	markdown := fmt.Sprintf(`### Packets Processed
+- **Total Packets:** %d
+- **DNS Requests Matched for Target:** %d
+
+### Injections by Type
+- **NXDOMAIN:** %d
+- **SERVFAIL:** %d
+- **TIMEOUT:** %d
+- **Total Injected:** %d`,
+		mv.Seen,
+		mv.DNSMatched,
+		mv.InjectedNXDOMAIN,
+		mv.InjectedSERVFAIL,
+		mv.InjectedTimeout,
+		mv.Injected,
+	)
+
+	now := time.Now()
+	messageType := "dns_stats_markdown"
+	messages := []action_kit_api.Message{
+		{
+			Message:   markdown,
+			Timestamp: &now,
+			Type:      &messageType,
+		},
+	}
+
+	return extutil.Ptr(messages), nil
 }

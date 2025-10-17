@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: 2025 Roblox Corporation
 // Author: Tom Handal <thandal@roblox.com>
 
+//go:build linux
+
 package ebpf
 
 import (
@@ -11,8 +13,8 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -38,9 +40,6 @@ const (
 type DNSErrorInjectionConfig struct {
 	ErrorTypes   []string
 	IncludeCIDRs []string
-	ExcludeCIDRs []string
-	IncludePorts []int
-	ExcludePorts []int
 	Interfaces   []string
 	IsContainer  bool // true for container attacks (docker0), false for host attacks (eth0/eno1)
 }
@@ -86,6 +85,33 @@ func (l *DNSErrorInjectionLoader) Load(ctx context.Context, config DNSErrorInjec
 	if err := l.configureMaps(config); err != nil {
 		return fmt.Errorf("configure maps: %w", err)
 	}
+
+	// Attach programs to network interfaces
+	if err := l.attachPrograms(ctx, config.Interfaces); err != nil {
+		return fmt.Errorf("attach programs: %w", err)
+	}
+
+	l.interfaces = config.Interfaces
+
+	// Start periodic metrics logging
+	l.startMetricsLogger(10 * time.Second)
+	return nil
+}
+
+// Load creates the eBPF collection without attaching
+func (l *DNSErrorInjectionLoader) LoadCollection() error {
+	coll, err := ebpf.NewCollection(l.spec)
+	if err != nil {
+		return fmt.Errorf("create eBPF collection: %w", err)
+	}
+	l.coll = coll
+	return nil
+}
+
+// Attach attaches the eBPF programs to network interfaces
+func (l *DNSErrorInjectionLoader) Attach(config DNSErrorInjectionConfig) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
 	// Attach programs to network interfaces
 	if err := l.attachPrograms(ctx, config.Interfaces); err != nil {
@@ -190,40 +216,8 @@ func (l *DNSErrorInjectionLoader) configureCIDRMaps(config DNSErrorInjectionConf
 		}
 	}
 
-	// Configure IPv6 CIDR map
-	ipv6Map := l.coll.Maps["ipv6_cidr_map"]
-	if ipv6Map != nil {
-		for _, cidr := range config.IncludeCIDRs {
-			_, ipNet, err := net.ParseCIDR(cidr)
-			if err != nil {
-				log.Warn().Str("cidr", cidr).Err(err).Msg("invalid IPv6 CIDR, skipping")
-				continue
-			}
-
-			if ipNet.IP.To4() != nil {
-				continue // Skip IPv4 addresses
-			}
-
-			prefixLen, _ := ipNet.Mask.Size()
-			key := struct {
-				PrefixLen uint32
-				Addr      [4]uint32
-			}{
-				PrefixLen: uint32(prefixLen),
-			}
-
-			// Convert IPv6 address to 4 uint32 values
-			ipv6 := ipNet.IP.To16()
-			for i := 0; i < 4; i++ {
-				key.Addr[i] = uint32(ipv6[i*4])<<24 | uint32(ipv6[i*4+1])<<16 | uint32(ipv6[i*4+2])<<8 | uint32(ipv6[i*4+3])
-			}
-
-			value := uint8(1)
-			if err := ipv6Map.Put(key, value); err != nil {
-				log.Warn().Str("cidr", cidr).Err(err).Msg("failed to add IPv6 CIDR to map")
-			}
-		}
-	}
+	// IPv6 support not yet implemented
+	// Future: Add ipv6_cidr_map configuration here
 
 	return nil
 }
@@ -234,18 +228,16 @@ func (l *DNSErrorInjectionLoader) configurePortMaps(config DNSErrorInjectionConf
 		return nil
 	}
 
-	// Add DNS port by default
-	ports := []int{DnsPort}
-	ports = append(ports, config.IncludePorts...)
-
-	for _, port := range ports {
-		key := uint16(port)
-		value := uint8(1)
-		if err := portMap.Put(key, value); err != nil {
-			log.Warn().Int("port", port).Err(err).Msg("failed to add port to map")
-		}
+	// Always configure DNS port 53
+	// Note: The eBPF code also hardcodes port 53 checks, so this map is somewhat redundant
+	// but kept for consistency with the eBPF map structure
+	key := uint16(DnsPort)
+	value := uint8(1)
+	if err := portMap.Put(key, value); err != nil {
+		return fmt.Errorf("failed to configure DNS port: %w", err)
 	}
 
+	log.Debug().Int("port", DnsPort).Msg("configured DNS port")
 	return nil
 }
 
@@ -271,14 +263,14 @@ func (l *DNSErrorInjectionLoader) attachPrograms(ctx context.Context, interfaces
 		}
 
 		// Attach ingress filter
-		ingressFilter, err := attachTCFilter(link, ingressProg, "tc/ingress", netlink.HANDLE_MIN_INGRESS)
+		ingressFilter, err := attachTCFilter(link, ingressProg, "steadybit-dns-error-injection/ingress", netlink.HANDLE_MIN_INGRESS)
 		if err != nil {
 			return fmt.Errorf("failed to attach ingress filter to %s: %w", ifaceName, err)
 		}
 		l.filters = append(l.filters, ingressFilter)
 
 		// Attach egress filter
-		egressFilter, err := attachTCFilter(link, egressProg, "tc/egress", netlink.HANDLE_MIN_EGRESS)
+		egressFilter, err := attachTCFilter(link, egressProg, "steadybit-dns-error-injection/egress", netlink.HANDLE_MIN_EGRESS)
 		if err != nil {
 			return fmt.Errorf("failed to attach egress filter to %s: %w", ifaceName, err)
 		}
@@ -378,25 +370,16 @@ func (l *DNSErrorInjectionLoader) Close() error {
 }
 
 type metricsValue struct {
-	Seen              uint64
-	IPv4              uint64
-	IPv6              uint64
-	EgressQueries     uint64
-	IngressResponses  uint64
-	DNSMatched        uint64
-	Injected          uint64
-	InjectedNXDOMAIN  uint64
-	InjectedSERVFAIL  uint64
-	IPv4AllowedCalled uint64
-	IPv4AllowedPassed uint64
-	LastSaddr         uint32 // diagnostic: last seen source IP (network byte order)
-	LastDaddr         uint32 // diagnostic: last seen dest IP (network byte order)
-	LastRejectedSaddr uint32 // diagnostic: last rejected source IP
-	LastRejectedDaddr uint32 // diagnostic: last rejected dest IP
-	LastLookupSrcNE   uint32 // diagnostic: last source IP we looked up (network-endian)
-	LastLookupSrcHE   uint32 // diagnostic: last source IP we looked up (host-endian)
-	LastLookupDstHE   uint32 // diagnostic: last dest IP we looked up (host-endian)
-	_                 uint32 // padding to align to 8 bytes (28 bytes of uint32 + 4 padding = 32 bytes)
+	Seen             uint64 // Total packets seen
+	IPv4             uint64 // IPv4 packets
+	IPv6             uint64 // IPv6 packets (future use)
+	DNSMatched       uint64 // DNS packets matching our filters
+	Injected         uint64 // Total DNS errors injected
+	InjectedNXDOMAIN uint64 // NXDOMAIN errors injected
+	InjectedSERVFAIL uint64 // SERVFAIL errors injected
+	InjectedTimeout  uint64 // TIMEOUT (dropped packets)
+	LastSaddr        uint32 // Last seen source IP (for debugging)
+	LastDaddr        uint32 // Last seen dest IP (for debugging)
 }
 
 func (l *DNSErrorInjectionLoader) startMetricsLogger(interval time.Duration) {
@@ -444,32 +427,16 @@ func (l *DNSErrorInjectionLoader) startMetricsLogger(interval time.Duration) {
 					Uint64("seen", mv.Seen).
 					Uint64("ipv4", mv.IPv4).
 					Uint64("ipv6", mv.IPv6).
-					Uint64("egress_queries", mv.EgressQueries).
-					Uint64("ingress_responses", mv.IngressResponses).
 					Uint64("dns_matched", mv.DNSMatched).
 					Uint64("injected", mv.Injected).
 					Uint64("injected_nxdomain", mv.InjectedNXDOMAIN).
 					Uint64("injected_servfail", mv.InjectedSERVFAIL).
-					Uint64("ipv4_allowed_called", mv.IPv4AllowedCalled).
-					Uint64("ipv4_allowed_passed", mv.IPv4AllowedPassed)
+					Uint64("injected_timeout", mv.InjectedTimeout)
 
 				if mv.LastSaddr != 0 || mv.LastDaddr != 0 {
 					logEvent = logEvent.
 						Str("last_saddr", formatIP(mv.LastSaddr)).
 						Str("last_daddr", formatIP(mv.LastDaddr))
-				}
-
-				if mv.LastRejectedSaddr != 0 || mv.LastRejectedDaddr != 0 {
-					logEvent = logEvent.
-						Str("last_rejected_saddr", formatIP(mv.LastRejectedSaddr)).
-						Str("last_rejected_daddr", formatIP(mv.LastRejectedDaddr))
-				}
-
-				if mv.LastLookupSrcNE != 0 {
-					logEvent = logEvent.
-						Str("last_lookup_src_ne", formatIP(mv.LastLookupSrcNE)).
-						Str("last_lookup_src_he", formatIP(mv.LastLookupSrcHE)).
-						Str("last_lookup_dst_he", formatIP(mv.LastLookupDstHE))
 				}
 
 				logEvent.Msg("dns-error-injection metrics")
@@ -498,26 +465,98 @@ func WriteEmbeddedDNSErrorObject(targetPath string) error {
 	return nil
 }
 
-// BuildEBPFObject compiles the eBPF C code to object file
-func BuildDNSErrorInjectionObject() error {
-	// Check if clang is available
-	if _, err := exec.LookPath("clang"); err != nil {
-		return fmt.Errorf("clang not found: %w", err)
-	}
+// CleanupOrphanedFilters removes any orphaned DNS error injection TC filters from previous crashes
+// Should be called during extension initialization
+func CleanupOrphanedFilters() error {
+	log.Info().Msg("checking for orphaned DNS error injection TC filters from previous crashes")
 
-	// Compile eBPF C code
-	cmd := exec.Command("clang",
-		"-O2", "-g", "-target", "bpf",
-		"-c", "dns_error_injection.c",
-		"-o", "dns_error_injection.o")
-
-	cmd.Dir = "action-kit/go/action_kit_commons/network/ebpf"
-
-	output, err := cmd.CombinedOutput()
+	// Get all network interfaces
+	links, err := netlink.LinkList()
 	if err != nil {
-		return fmt.Errorf("compile eBPF: %w, output: %s", err, string(output))
+		return fmt.Errorf("failed to list network links: %w", err)
 	}
 
-	log.Info().Msg("eBPF DNS error injection object compiled successfully")
+	cleanedCount := 0
+	for _, link := range links {
+		// Check common interfaces where we attach eBPF programs
+		ifName := link.Attrs().Name
+		if ifName != "docker0" && !strings.HasPrefix(ifName, "br-") &&
+			ifName != "eth0" && !strings.HasPrefix(ifName, "eno") {
+			continue // Skip interfaces we don't use
+		}
+
+		// Check for our TC filters on both ingress and egress
+		for _, parent := range []uint32{netlink.HANDLE_MIN_INGRESS, netlink.HANDLE_MIN_EGRESS} {
+			filters, err := netlink.FilterList(link, parent)
+			if err != nil {
+				log.Warn().
+					Str("interface", ifName).
+					Uint32("parent", parent).
+					Err(err).
+					Msg("failed to list TC filters")
+				continue
+			}
+
+			for _, filter := range filters {
+				bpfFilter, ok := filter.(*netlink.BpfFilter)
+				if !ok {
+					continue
+				}
+
+				// Check if this is our DNS error injection filter
+				// Our filters have very specific names that include "steadybit-dns-error-injection"
+				// This makes them uniquely identifiable as our filters
+				expectedIngressName := fmt.Sprintf("steadybit-dns-error-injection/ingress-%s", ifName)
+				expectedEgressName := fmt.Sprintf("steadybit-dns-error-injection/egress-%s", ifName)
+
+				if bpfFilter.Name == expectedIngressName || bpfFilter.Name == expectedEgressName {
+					log.Warn().
+						Str("interface", ifName).
+						Str("filter_name", bpfFilter.Name).
+						Uint32("handle", bpfFilter.Handle).
+						Uint32("priority", uint32(bpfFilter.Priority)).
+						Msg("removing orphaned DNS error injection TC filter")
+
+					if err := netlink.FilterDel(bpfFilter); err != nil {
+						log.Warn().
+							Str("interface", ifName).
+							Err(err).
+							Msg("failed to delete orphaned TC filter")
+					} else {
+						cleanedCount++
+					}
+				}
+			}
+		}
+	}
+
+	if cleanedCount > 0 {
+		log.Info().Int("count", cleanedCount).Msg("cleaned up orphaned DNS error injection TC filters")
+	} else {
+		log.Info().Msg("no orphaned DNS error injection TC filters found")
+	}
+
 	return nil
+}
+
+// GetRawMetrics retrieves raw metrics from the eBPF program
+func (l *DNSErrorInjectionLoader) GetRawMetrics() (*metricsValue, error) {
+	if l.coll == nil {
+		return nil, fmt.Errorf("eBPF collection not loaded")
+	}
+
+	// Get the metrics map
+	metricsMap := l.coll.Maps["metrics_map"]
+	if metricsMap == nil {
+		return nil, fmt.Errorf("metrics map not found in eBPF collection")
+	}
+
+	// Read metrics from the eBPF map
+	var key uint32 = 0
+	var mv metricsValue
+	if err := metricsMap.Lookup(&key, &mv); err != nil {
+		return nil, fmt.Errorf("failed to read metrics from eBPF map: %w", err)
+	}
+
+	return &mv, nil
 }
