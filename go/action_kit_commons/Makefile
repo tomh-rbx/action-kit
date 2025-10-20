@@ -2,6 +2,12 @@
 # QUALITY CONTROL
 # ==================================================================================== #
 
+## build-ebpf: build the eBPF object
+.PHONY: build-ebpf
+build-ebpf:
+	@echo "Building eBPF object..."
+	cd network/ebpf && make build-docker
+
 ## tidy: format code and tidy modfile
 .PHONY: tidy
 tidy:

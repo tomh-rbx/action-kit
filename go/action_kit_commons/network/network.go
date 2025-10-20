@@ -102,7 +102,34 @@ func generateAndRunCommands(ctx context.Context, runner CommandRunner, opts Opts
 		logCurrentTcRules(ctx, runner, "before")
 	}
 
-	// If opts provide iptables scripts, execute them first
+	// If opts provide nftables or iptables scripts, execute them first
+	if nft, ok := opts.(NftablesScriptProvider); ok {
+		script, scriptErr := nft.NftablesScript(mode)
+		if scriptErr != nil {
+			return scriptErr
+		}
+		if log.Debug().Enabled() && strings.TrimSpace(script) != "" {
+			log.Debug().Str("mode", string(mode)).Str("nft", script).Msg("prepared nftables script")
+		}
+		if len(strings.TrimSpace(script)) > 0 {
+			lines := strings.Split(strings.TrimRight(script, "\n"), "\n")
+			if _, restoreErr := runner.run(ctx, []string{"nft", "-f", "-"}, lines); restoreErr != nil {
+				err = errors.Join(err, restoreErr)
+			}
+		}
+	}
+
+	// Try eBPF first for DNS error injection (if supported)
+	if dnsOpts, ok := opts.(*DNSErrorInjectionOpts); ok && mode == ModeAdd {
+		if success, eBPFErr := dnsOpts.TryEBPF(); success {
+			log.Debug().Msg("using eBPF for DNS error injection")
+			// eBPF is handling the marking, so we skip iptables
+		} else if eBPFErr != nil {
+			log.Debug().Err(eBPFErr).Msg("eBPF not available, falling back to iptables")
+		}
+	}
+
+	// Fallback iptables provider (legacy)
 	if provider, ok := opts.(IptablesScriptProvider); ok {
 		v4, v6, scriptErr := provider.IptablesScripts(mode)
 		if scriptErr != nil {

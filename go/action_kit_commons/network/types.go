@@ -46,6 +46,15 @@ type IptablesScriptProvider interface {
 	IptablesScripts(mode Mode) (v4 string, v6 string, err error)
 }
 
+// NftablesScriptProvider is an optional interface that Opts can implement
+// to provide nftables shell script which will be executed before tc commands.
+// Use to mark packets selected by nftables which tc will then act upon.
+type NftablesScriptProvider interface {
+	// NftablesScript returns a complete nftables script (family inet) to apply or delete rules.
+	// Return empty string if no script is required.
+	NftablesScript(mode Mode) (string, error)
+}
+
 type Filter struct {
 	Include []NetWithPortRange
 	Exclude []NetWithPortRange

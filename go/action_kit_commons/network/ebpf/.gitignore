@@ -1,0 +1,6 @@
+# Compiled eBPF objects
+*.o
+*.so
+
+# Do NOT ignore C source files - they should be tracked
+# !*.c is not needed since we're not ignoring them above

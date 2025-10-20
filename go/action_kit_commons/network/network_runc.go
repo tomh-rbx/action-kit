@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path"
 	"strconv"
 	"time"
@@ -108,11 +109,24 @@ func (r *runcRunner) executeInNetworkNamespaceUsingRunc(ctx context.Context, pro
 		ociruntime.WithHostname(id),
 		ociruntime.WithAnnotations(map[string]string{"com.steadybit.sidecar": "true"}),
 		ociruntime.WithNamespaces(ociruntime.FilterNamespaces(r.sidecar.TargetProcess.Namespaces, specs.NetworkNamespace)),
-		ociruntime.WithCapabilities("CAP_NET_ADMIN"),
+		ociruntime.WithCapabilities("CAP_NET_ADMIN", "CAP_SYS_ADMIN"),
 		ociruntime.WithCopyEnviron(),
 		ociruntime.WithProcessArgs(processArgs...),
 	); err != nil {
 		return "", err
+	}
+
+	// Ensure eBPF object is available inside sidecar rootfs when using tc obj path
+	// Copy from host path if present to same path inside sidecar bundle
+	// This keeps tc filter obj references working in the sidecar's mount namespace
+	const ebpfObj = "/etc/steadybit/dns_error_injection.o"
+	if _, statErr := os.Stat(ebpfObj); statErr == nil {
+		dst := path.Join(bundle.Path(), "rootfs", ebpfObj)
+		if mkErr := os.MkdirAll(path.Dir(dst), 0o755); mkErr == nil {
+			if data, rdErr := os.ReadFile(ebpfObj); rdErr == nil {
+				_ = os.WriteFile(dst, data, 0o644)
+			}
+		}
 	}
 
 	var outb, errb bytes.Buffer
